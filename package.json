@@ -1,0 +1,46 @@
+{
+  "name": "cacache-level",
+  "version": "1.0.0",
+  "description": "A content-addressable, file system based abstract-level database on top of cacache",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ccollie/cacache-level.git"
+  },
+  "homepage": "https://github.com/ccollie/cacache-level",
+  "main": "index.js",
+  "types": "./index.d.ts",
+  "scripts": {
+    "test": "standard && hallmark && (nyc -s node test.js | faucet) && nyc report",
+    "coverage": "nyc report -r lcovonly"
+  },
+  "keywords": [
+    "level",
+    "leveldb",
+    "cacache",
+    "abstract-level"
+  ],
+  "author": "clayton collie <collie.clayton@gmail.com>",
+  "license": "MIT",
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "devDependencies": {
+    "@voxpelli/tsconfig": "^4.0.0",
+    "faucet": "^0.0.1",
+    "hallmark": "^4.0.0",
+    "nyc": "^15.1.0",
+    "rimraf": "^3.0.2",
+    "standard": "^17.0.0",
+    "tape": "^5.0.1",
+    "typescript": "^4.5.5"
+  },
+  "dependencies": {
+    "abstract-level": "^1.0.3",
+    "cacache": "^16.1.1",
+    "catering": "^2.1.1",
+    "mkdirp": "^1.0.4",
+    "module-error": "^1.0.2",
+    "p-map": "4.0.0"
+  }
+}
