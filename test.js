@@ -10,7 +10,7 @@ const CACHE_DIR = resolve(__dirname, '.test-cache')
 let idx = 0
 
 const location = function () {
-  return '__Level_db__' + idx++
+  return '__test__' + idx++
 }
 
 function createCacheDir (sub) {
