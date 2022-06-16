@@ -8,20 +8,15 @@ const {
 } = require('abstract-level')
 
 const cacache = require('cacache')
+const bounds = require('binary-searching')
 const { fromPromise } = require('catering')
 const os = require('os')
 const pMap = require('p-map')
 
 const rangeOptions = new Set(['gt', 'gte', 'lt', 'lte'])
 const kNone = Symbol('none')
-const kDb = Symbol('db')
 const kDone = Symbol('done')
-const kLowerBound = Symbol('lowerBound')
-const kUpperBound = Symbol('upperBound')
 const kReverse = Symbol('reverse')
-const kOptions = Symbol('options')
-const kAdvanceNext = Symbol('advanceNext')
-const kAdvancePrev = Symbol('advancePrev')
 const kNext = Symbol('next')
 const kNextv = Symbol('nextv')
 const kAll = Symbol('all')
@@ -36,9 +31,11 @@ const kAwaitIndex = Symbol('process-seek')
 const kSeekOptions = Symbol('seek-options')
 const kConcurrency = Symbol('concurrency')
 const kBatchSize = Symbol('compare')
+const kHandleSeek = Symbol('handle-seek')
+const kGetKeyBatch = Symbol('get-key-batch')
 
-const DEFAULT_BATCH_SIZE = 50
-const DEFAULT_CONCURRENCY = os.cpus().length * 3
+const DEFAULT_BATCH_SIZE = 25
+const DEFAULT_CONCURRENCY = os.cpus().length * 4
 
 function compare (a, b) {
   // Only relevant when storeEncoding is 'utf8',
@@ -92,39 +89,31 @@ class KeyIterator extends AbstractKeyIterator {
   }
 
   _next (callback) {
-    this[kAwaitIndex]().then(() => {
+    this[kAwaitIndex](err => {
+      if (err) return this.nextTick(callback, err)
       const key = this[kAdvance]()
       this.nextTick(callback, null, key)
-    }).catch(callback)
+    })
   }
 
   _nextv (size, options, callback) {
-    this[kAwaitIndex]().then(() => {
-      if (this[kDone]) return this.nextTick(callback)
-      const keys = []
-
-      while (!this[kDone] && keys.length < size) {
-        const key = this[kAdvance]()
-        if (key === null) break
-        keys.push(key)
-      }
-
+    this[kAwaitIndex](err => {
+      if (err) return this.nextTick(callback, err)
+      const keys = this[kGetKeyBatch](size)
       this.nextTick(callback, null, keys)
-    }).catch(callback)
+    })
   }
 
   _all (options, callback) {
-    this[kAwaitIndex]().then(() => {
-      const keys = []
-
-      while (!this[kDone]) {
-        const key = this[kAdvance]()
-        if (key === null) break
-        keys.push(key)
-      }
-
+    this[kAwaitIndex](err => {
+      if (err) return this.nextTick(callback, err)
+      const cursor = this[kCursor]
+      const allKeys = this[kIndexKeys]
+      const keys = allKeys.slice(cursor)
+      this[kCursor] = allKeys.length
+      this[kDone] = true
       this.nextTick(callback, null, keys)
-    }).catch(callback)
+    })
   }
 }
 
@@ -142,50 +131,102 @@ class ValueIterator extends AbstractValueIterator {
   }
 
   _nextv (size, options, callback) {
-    this[kNextv](size, options, (err, values) => {
+    this[kAwaitIndex]((err) => {
       if (err) return this.nextTick(callback, err)
-      const result = values.map(value => value[1])
-      this.nextTick(callback, null, result)
+      const location = this[kLocation]
+      const concurrency = this[kConcurrency]
+      const keys = this[kGetKeyBatch](size)
+
+      getMany(location, keys, concurrency, (err, values) => {
+        if (err) return this.nextTick(callback, err)
+        this.nextTick(callback, null, values)
+      })
     })
   }
 
   _all (options, callback) {
     this[kAll](options, (err, values) => {
       if (err) return this.nextTick(callback, err)
-      const result = values.map(value => value[1])
-      this.nextTick(callback, null, result)
+      this.nextTick(callback, null, values)
     })
   }
 }
 
 for (const Ctor of [Iterator, KeyIterator, ValueIterator]) {
   Ctor.prototype[kInit] = function (db, options) {
-    const location = db[kLocation]
+    this[kLocation] = db[kLocation]
     const reverse = options.reverse
 
-    this[kDb] = db
-    this[kCursor] = 0
     this[kReverse] = reverse
-    this[kOptions] = options
     this[kBatchSize] = db[kBatchSize]
     this[kConcurrency] = db[kConcurrency]
 
-    this[kAdvance] = this[kReverse] ? this[kAdvancePrev] : this[kAdvanceNext]
-
-    this[kIndexPromise] = cacache.ls(location).then(entries => {
-      const keys = entries.map(entry => entry.key).sort(compare)
-
+    this[kIndexPromise] = cacache.ls(this[kLocation]).then(entries => {
+      let keys = Object.keys(entries).sort(compare)
       this[kEntries] = entries
-      const { start, end, lowerBound, upperBound } = parseBounds(keys, options)
+
+      let upperBound
+      let lowerBound
+
+      let start
+      let end
 
       this[kCursor] = 0
-      this[kLowerBound] = lowerBound
-      this[kUpperBound] = upperBound
-      this[kIndexKeys] = keys.splice(start, end - start + 1)
+
+      if (!reverse) {
+        lowerBound = 'gte' in options ? options.gte : 'gt' in options ? options.gt : kNone
+        upperBound = 'lte' in options ? options.lte : 'lt' in options ? options.lt : kNone
+
+        if (lowerBound === kNone) {
+          start = 0
+        } else if ('gte' in options) {
+          start = bounds.ge(keys, lowerBound)
+        } else {
+          start = bounds.gt(keys, lowerBound)
+        }
+
+        if (upperBound !== kNone) {
+          if ('lte' in options) {
+            end = bounds.le(keys, upperBound, compare, start)
+          } else {
+            end = bounds.lt(keys, upperBound, compare, start)
+          }
+        } else {
+          end = keys.length - 1
+        }
+      } else {
+        lowerBound = 'lte' in options ? options.lte : 'lt' in options ? options.lt : kNone
+        upperBound = 'gte' in options ? options.gte : 'gt' in options ? options.gt : kNone
+
+        if (lowerBound === kNone) {
+          end = keys.length - 1
+        } else if ('lte' in options) {
+          end = bounds.le(keys, lowerBound, compare)
+        } else {
+          end = bounds.lt(keys, lowerBound, compare)
+        }
+
+        if (upperBound !== kNone) {
+          if ('gte' in options) {
+            start = bounds.ge(keys, upperBound, compare)
+          } else {
+            start = bounds.gt(keys, upperBound, compare)
+          }
+        } else {
+          start = 0
+        }
+      }
+
+      keys = keys.slice(start, end - start + 1)
+      if (reverse) {
+        keys = keys.reverse()
+      }
+
+      this[kIndexKeys] = keys
     })
   }
 
-  Ctor.prototype[kAdvanceNext] = function () {
+  Ctor.prototype[kAdvance] = function () {
     if (this[kDone]) {
       return null
     }
@@ -202,63 +243,55 @@ for (const Ctor of [Iterator, KeyIterator, ValueIterator]) {
     }
   }
 
-  Ctor.prototype[kAdvancePrev] = function () {
-    if (this[kDone]) {
-      return null
-    }
-    let cursor = this[kCursor]
-    if (cursor > 0) {
-      const key = this[kIndexKeys][cursor--]
-      this[kCursor] = cursor
-      this[kDone] = (cursor === 0)
-      return key
-    } else {
-      this[kDone] = true
-      return null
-    }
-  }
-
   Ctor.prototype[kNext] = function (callback) {
-    this[kAwaitIndex]().then(() => {
+    this[kAwaitIndex](err => {
+      if (err) return this.nextTick(callback, err)
       const key = this[kAdvance]()
       if (!key) return this.nextTick(callback)
       getValue(this[kLocation], key, (err, value) => {
-        this.nextTick(callback, err, key, value.data)
+        this.nextTick(callback, err, key, value)
       })
-    }).catch(callback)
+    })
   }
 
-  function getKeyBatch (iter, batchSize) {
-    const slice = []
-    do {
-      const key = iter[kAdvance]()
-      if (!key) break
-      slice.push(key)
-    } while (slice.length < batchSize)
-
-    return slice
+  Ctor.prototype[kGetKeyBatch] = function (batchSize) {
+    const keys = this[kIndexKeys]
+    const cursor = this[kCursor]
+    if (cursor > keys.length - 1) {
+      return []
+    }
+    if (!batchSize) {
+      batchSize = this[kBatchSize]
+    }
+    const batch = keys.slice(cursor, cursor + batchSize)
+    this[kCursor] += batch.length
+    this[kDone] = (this[kCursor] >= keys.length)
+    return batch
   }
 
   Ctor.prototype[kNextv] = function (size, options, callback) {
-    this[kAwaitIndex]().then(() => {
+    this[kAwaitIndex](err => {
+      if (err) return this.nextTick(callback, err)
       const location = this[kLocation]
       const concurrency = this[kConcurrency]
 
-      const keys = getKeyBatch(this, size)
+      const keys = this[kGetKeyBatch](size)
 
       getMany(location, keys, concurrency, (err, values) => {
         if (err) return this.nextTick(callback, err)
         const result = []
         for (let i = 0; i < keys.length; i++) {
-          result.push([keys[i], values[i].data])
+          result.push([keys[i], values[i]])
         }
         this.nextTick(callback, null, result)
       })
-    }).catch(callback)
+    })
   }
 
   Ctor.prototype[kAll] = function (options, callback) {
-    this[kAwaitIndex]().then(() => {
+    this[kAwaitIndex](err => {
+      if (err) return this.nextTick(callback, err)
+
       if (this[kDone]) {
         return this.nextTick(callback)
       }
@@ -266,19 +299,18 @@ for (const Ctor of [Iterator, KeyIterator, ValueIterator]) {
       const result = []
       const location = this[kLocation]
       const concurrency = this[kConcurrency]
-      const batchSize = this[kBatchSize]
 
       const loop = () => {
-        const keys = getKeyBatch(this, batchSize)
+        const keys = this[kGetKeyBatch]()
 
         if (keys.length === 0) {
           return this.nextTick(callback, null, result)
         }
 
         getMany(location, keys, concurrency, (err, values) => {
-          if (err) return callback(err)
+          if (err) return this.nextTick(callback, err)
           values.forEach((value, i) => {
-            result.push([keys[i], value.data])
+            result.push([keys[i], value])
           })
           if (values.length === 0) {
             return this.nextTick(callback, null, result)
@@ -287,8 +319,9 @@ for (const Ctor of [Iterator, KeyIterator, ValueIterator]) {
           this.nextTick(loop)
         })
       }
+
       this.nextTick(loop)
-    }).catch(callback)
+    })
   }
 
   Ctor.prototype._seek = function (target, options) {
@@ -298,133 +331,47 @@ for (const Ctor of [Iterator, KeyIterator, ValueIterator]) {
     }
   }
 
-  Ctor.prototype[kAwaitIndex] = function () {
+  Ctor.prototype[kAwaitIndex] = function (callback) {
+    const promise = this[kIndexPromise]
     const options = this[kSeekOptions]
-    if (!options) {
-      return this[kIndexPromise]
-    }
-    this[kSeekOptions] = null
 
-    // handle seek
-    return this[kIndexPromise].then(() => {
-      const target = options.target
-      const keys = this[kIndexKeys]
-      const reverse = this[kReverse]
-      if (!reverse) {
-        const beforeStart = compare(target, keys[0]) < 0
-        const afterEnd = compare(target, keys[keys.length - 1]) > 0
-        if (beforeStart) {
-          if ('gt' in options || 'gte' in options) {
-            this[kDone] = false
-            this[kCursor] = 0
-          } else {
-            this[kDone] = true
-            this[kCursor] = keys.length
-          }
-          return
-        } else if (afterEnd) {
-          // example: keys =  0 1 2 3 4 5 6 7 8 9 and  { target: { lte: 1000 } }
-          if ('lt' in options || 'lte' in options) {
-            this[kDone] = false
-            this[kCursor] = 0
-          } else {
-            this[kDone] = true
-            this[kCursor] = -1
-          }
-          return
-        }
-
-        let pos = binarySearch(keys, target, compare)
-        if (pos < 0) {
-          // -1 means the target is less than the first key
-          if (pos === -1) {
-            if (options.gt || options.gte) {
-              pos = 0
-            } else {
-              this[kDone] = true
-              pos = keys.length
-            }
-          } else {
-            // pos represents the position of the first key that is greater than target
-            pos = -pos
-          }
-        } else {
-          if ('gt' in options) {
-            pos++
-          }
-        }
-
-        this[kCursor] = pos
-        this[kDone] = (pos >= keys.length)
-      } else {
-        const beforeStart = compare(target, keys[keys.length - 1]) > 0
-        const afterEnd = compare(target, keys[0]) < 0
-
-        if (beforeStart) {
-          // example: keys =  9 8 7 6 5 4 3 2 1 0  and { target: { lte: 1000 } }
-          if ('lt' in options || 'lte' in options) {
-            this[kDone] = false
-            this[kCursor] = keys.length - 1
-          } else {
-            this[kDone] = true
-            this[kCursor] = -1
-          }
-          return
-        } else if (afterEnd) {
-          // example: keys =  0 1 2 3 4 5 6 7 8 9 and { target: { gt: -1 } }
-          if ('gt' in options || 'gte' in options) {
-            this[kDone] = false
-            this[kCursor] = keys.length - 1
-          } else {
-            this[kDone] = true
-            this[kCursor] = 0
-          }
-          return
-        }
-        let pos = binarySearch(keys, target, compare)
-        if (pos < 0) {
-          // -1 means the target is greater than the last key
-          if (pos === -1) {
-            this[kCursor] = keys.length - 1
-            if (options.lt || options.lte) {
-              this[kDone] = false
-              this[kCursor] = keys.length - 1
-            } else {
-              this[kDone] = true
-              this[kCursor] = -1
-            }
-            return
-          } else {
-            // pos represents the position of the last key that is less than target
-            pos = -pos - 1
-          }
-        } else {
-          if ('gt' in options) {
-            pos--
-          }
-        }
-        this[kCursor] = pos
+    promise.then(() => {
+      if (options) {
+        this[kSeekOptions] = null
+        this[kHandleSeek](options)
       }
+      this.nextTick(callback)
     }).catch(err => {
-      this[kDone] = true
-      this[kCursor] = -1
-      return err
+      this.nextTick(callback, err)
     })
+  }
+
+  Ctor.prototype[kHandleSeek] = function (options) {
+    const target = options.target
+    const keys = this[kIndexKeys]
+    const reverse = this[kReverse]
+    let pos
+    if (reverse) {
+      pos = bounds.le(keys, target, compare)
+    } else {
+      pos = bounds.ge(keys, target, compare)
+    }
+    this[kCursor] = pos
+    this[kDone] = (pos < 0) || (pos >= keys.length)
   }
 }
 
 class CacacheLevel extends AbstractLevel {
-  constructor (location, options, _) {
+  constructor (location, options) {
     // Take a dummy location argument to align with other implementations
     if (typeof location === 'object' && location !== null) {
       options = location
     }
 
-    const opts = {
-      ...(options || {}),
-      keyEncoding: 'utf8',
-      valueEncoding: 'buffer'
-    }
+    const {
+      rootDirectory,
+      ...forward
+    } = options || {}
 
     super({
       seek: true,
@@ -432,14 +379,14 @@ class CacacheLevel extends AbstractLevel {
       createIfMissing: false,
       errorIfExists: false,
       encodings: {
-        buffer: true,
-        utf8: true,
-        view: true
+        buffer: true
       },
       additionalMethods: {
-        verify: true
+        getInfo: true,
+        verify: true,
+        destroy: true
       }
-    }, opts)
+    }, forward)
 
     // todo: validate location is valid path segment
     this[kLocation] = location
@@ -451,18 +398,27 @@ class CacacheLevel extends AbstractLevel {
     return 'cacache-level'
   }
 
+  getInfo (key, callback) {
+    const location = this[kLocation]
+    key = encodeKey(key)
+    return fromPromise(cacache.get.info(location, key).catch(err => {
+      if (err.code === 'ENOENT') {
+        return null
+      }
+      throw err
+    }), callback)
+  }
+
   destroy (callback) {
     const location = this[kLocation]
-    callback = callback || (() => {})
-    cacache.rm.all(location)
-      .then(() => this.nextTick(callback))
-      .catch(err => this.nextTick(callback, err))
+    return fromPromise(cacache.rm.all(location), callback)
   }
 
   _put (key, value, options, callback) {
     const cachePath = this[kLocation]
-
-    cacache.put(cachePath, key, value).then(() => {
+    const metadata = options.metadata
+    key = encodeKey(key)
+    cacache.put(cachePath, key, value, metadata).then(() => {
       this.nextTick(callback)
     }).catch(err => {
       this.nextTick(callback, err)
@@ -474,21 +430,25 @@ class CacacheLevel extends AbstractLevel {
 
     getValue(cachePath, key, (err, entry) => {
       if (err) return this.nextTick(callback, err)
-      this.nextTick(callback, null, entry.data)
+      this.nextTick(callback, null, entry)
     })
   }
 
   _getMany (keys, options, callback) {
     const cachePath = this[kLocation]
     const concurrency = this[kConcurrency]
-    getMany(cachePath, keys, concurrency, callback)
+    getMany(cachePath, keys, concurrency, (err, values) => {
+      if (err) return this.nextTick(callback, err)
+      this.nextTick(callback, null, values)
+    })
   }
 
   _del (key, options, callback) {
     const cachePath = this[kLocation]
+    key = encodeKey(key)
     // todo: handle removeFully (see cacache docs)
     cacache.rm.entry(cachePath, key).then(() => {
-      // todo; mark for compaction
+      // todo: mark for compaction
       this.nextTick(callback)
     }).catch(err => {
       this.nextTick(callback, err)
@@ -501,35 +461,48 @@ class CacacheLevel extends AbstractLevel {
 
     const handlePut = (operations) => {
       return pMap(operations, (operation) => {
-        const { key, value } = operation
-        return cacache.put(cachePath, key, value)
+        const { key, value, metadata = {} } = operation
+        const _key = encodeKey(key)
+        return cacache.put(cachePath, _key, value, metadata)
       }, { concurrency })
     }
 
     const handleDel = (operations) => {
       return pMap(operations, (operation) => {
-        const { key } = operation
-        return cacache.rm.content(cachePath, key)
+        const key = encodeKey(operation.key)
+        return cacache.rm.entry(cachePath, key)
       }, { concurrency })
     }
 
     let idx = 0
+
     const loop = () => {
+      const processOp = (opType, ops) => {
+        let fn
+        if (opType === 'put') {
+          fn = handlePut
+        } else if (opType === 'del') {
+          fn = handleDel
+        } else {
+          const err = new Error(`Unknown operation type: ${opType}`)
+          return this.nextTick(callback, err)
+        }
+
+        fn(ops)
+          .then(() => this.nextTick(loop))
+          .catch((e) => this.nextTick(callback, e))
+      }
+
       if (idx >= operations.length) {
         return this.nextTick(callback)
       }
       const lastOpType = operations[idx].type
       const ops = []
       while (idx < operations.length && operations[idx].type === lastOpType) {
-        ops.push(operations[idx])
-        idx++
+        ops.push(operations[idx++])
       }
-      if (lastOpType === 'put') {
-        return handlePut(ops).then(loop).catch(callback)
-      } else if (lastOpType === 'del') {
-        return handleDel(ops).then(loop).catch(callback)
-      }
-      this.nextTick(callback)
+
+      return processOp(lastOpType, ops)
     }
 
     this.nextTick(loop)
@@ -537,7 +510,7 @@ class CacacheLevel extends AbstractLevel {
 
   _clear (options, callback) {
     const cachePath = this[kLocation]
-    if (options.limit === -1 && !Object.keys(options).some(isRangeOption)) {
+    if (options.limit === Infinity && !Object.keys(options).some(isRangeOption)) {
       // Delete everything.
       cacache.rm.all(cachePath).then(() => {
         this.nextTick(callback)
@@ -548,22 +521,24 @@ class CacacheLevel extends AbstractLevel {
 
     const handleClear = (iter) => {
       const location = iter[kLocation]
-      const batchSize = iter[kBatchSize]
       const concurrency = iter[kConcurrency]
 
       const loop = () => {
-        const keys = []
-        while (keys.length < batchSize) {
-          const key = iter[kAdvance]()
-          if (!key) break
-          keys.push(key)
-        }
+        const keys = iter[kGetKeyBatch]()
         if (keys.length > 0) {
           pMap(keys, (key) => {
             return cacache.rm.entry(location, key)
+              .catch((err) => {
+                // ignore not found errors
+                if (err.code === 'ENOENT') {
+                  return
+                }
+                throw err
+              })
           }, { concurrency })
-            .then(loop)
-            .catch(err => {
+            .then(() => {
+              this.nextTick(loop)
+            }).catch(err => {
               this.nextTick(callback, err)
             })
         }
@@ -575,7 +550,10 @@ class CacacheLevel extends AbstractLevel {
     }
 
     const iterator = this._keys(options)
-    iterator[kAwaitIndex]().then(handleClear).catch(callback)
+    iterator[kAwaitIndex](err => {
+      if (err) return this.nextTick(callback, err)
+      handleClear(iterator)
+    })
   }
 
   _iterator (options) {
@@ -604,16 +582,23 @@ class CacacheLevel extends AbstractLevel {
 }
 
 CacacheLevel.destroy = function (location, callback) {
-  callback = callback || (() => {})
-  cacache.rm.all(location)
-    .then(() => process.nextTick(callback))
-    .catch(err => process.nextTick(() => callback(err)))
+  return fromPromise(cacache.rm.all(location), callback)
 }
 
 exports.CacacheLevel = CacacheLevel
 
 function isRangeOption (k) {
   return rangeOptions.has(k)
+}
+
+function encodeKey (key) {
+  // since encoding apply both to key and value, we need to handle key encoding
+  // since cacache only handles string keys. For reference, we specified 'buffer' and 'utf8'
+  // in the CacacheLevel constructor.
+  if (Buffer.isBuffer(key)) {
+    return key.toString()
+  }
+  return key
 }
 
 function getValue (location, key, callback) {
@@ -628,8 +613,11 @@ function getValue (location, key, callback) {
 
 async function fetch (location, key) {
   try {
-    const data = await cacache.get(location, key)
-    return data || undefined
+    const value = await cacache.get(location, encodeKey(key))
+    if (value) {
+      return value.data
+    }
+    return undefined
   } catch (err) {
     if (err.code === 'ENOENT') {
       return undefined
@@ -643,118 +631,6 @@ function getMany (location, keys, concurrency, callback) {
     process.nextTick(() => callback(null, []))
   }
   pMap(keys, (key) => fetch(location, key), { concurrency })
-    .then((results) => callback(null, results))
-    .catch(callback)
-}
-
-/**
- * @param {Array} ar
- * @param {function} compare
- * @returns {number}
- */
-function binarySearch (ar, el, compare) {
-  let m = 0
-  let n = ar.length - 1
-  while (m <= n) {
-    const k = (n + m) >> 1
-    const cmp = compare(el, ar[k])
-    if (cmp > 0) {
-      m = k + 1
-    } else if (cmp < 0) {
-      n = k - 1
-    } else {
-      return k
-    }
-  }
-  return -m - 1
-}
-
-function parseBounds (keys, options) {
-  let upperBound
-  let lowerBound
-
-  let start = 0
-  let end = keys.length - 1
-  const reverse = !!options.reverse
-
-  if (!reverse) {
-    lowerBound = 'gte' in options ? options.gte : 'gt' in options ? options.gt : kNone
-    upperBound = 'lte' in options ? options.lte : 'lt' in options ? options.lt : kNone
-
-    if (upperBound === kNone) {
-      start = 0
-    } else {
-      start = binarySearch(keys, upperBound, compare)
-      if (start < 0) {
-        if (start === -1) {
-          // item not found in the list, start at the first item
-          start = 0
-        } else {
-          // start is the -1 * index where item would have been inserted
-          start = -start
-        }
-      } else {
-        if ('gt' in options) {
-          start++
-        }
-      }
-    }
-
-    if (upperBound !== kNone) {
-      end = binarySearch(keys, upperBound, compare)
-      if (end < 0) {
-        if (end === -1) {
-          // item not found in the list, end at the last item
-          end = keys.length - 1
-        } else {
-          end = -end - 1
-        }
-      } else {
-        if ('lt' in options) {
-          end--
-        }
-      }
-    }
-  } else {
-    lowerBound = 'lte' in options ? options.lte : 'lt' in options ? options.lt : kNone
-    upperBound = 'gte' in options ? options.gte : 'gt' in options ? options.gt : kNone
-
-    if (lowerBound === kNone) {
-      start = keys.length - 1
-    } else {
-      start = binarySearch(keys, upperBound, compare)
-      if (start < 0) {
-        if (start === -1) {
-          // item not found in the list, start at the last item
-          start = keys.length - 1
-        } else {
-          // start is the -1 * index where item would have been inserted
-          start = -start - 1
-        }
-      }
-      if ('lt' in options) {
-        start--
-      }
-    }
-
-    if (upperBound !== kNone) {
-      end = binarySearch(keys, upperBound, compare)
-      if (end < 0) {
-        if (end === -1) {
-          end = keys.length - 1
-        } else {
-          end = Math.abs(end)
-        }
-      }
-      // 0 1 2 3 4 5 6 7 8 9 10
-      // suppose we have gt 5, we increment end to 6
-      if ('gt' in options) {
-        end++
-      }
-    } else {
-      end = keys.length - 1
-    }
-  }
-
-  return { start, end, lowerBound, upperBound }
+    .then(() => process.nextTick(callback))
+    .catch(err => process.nextTick(callback, err))
 }
